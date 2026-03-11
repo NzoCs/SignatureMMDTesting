@@ -1,0 +1,13 @@
+arch>=8.0.0
+cython>=3.2.4
+iisignature>=0.24
+ipykernel>=7.2.0
+matplotlib>=3.10.8
+numba>=0.64.0
+numpy>=2.4.3
+pandas>=3.0.1
+seaborn>=0.13.2
+setuptools>=82.0.1
+torch>=2.10.0
+tqdm>=4.67.3
+yfinance>=1.2.0

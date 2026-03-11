@@ -1,0 +1,23 @@
+Metadata-Version: 2.4
+Name: signaturemmdtesting
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.13
+Description-Content-Type: text/markdown
+Requires-Dist: arch>=8.0.0
+Requires-Dist: cython>=3.2.4
+Requires-Dist: iisignature>=0.24
+Requires-Dist: ipykernel>=7.2.0
+Requires-Dist: matplotlib>=3.10.8
+Requires-Dist: numba>=0.64.0
+Requires-Dist: numpy>=2.4.3
+Requires-Dist: pandas>=3.0.1
+Requires-Dist: seaborn>=0.13.2
+Requires-Dist: setuptools>=82.0.1
+Requires-Dist: torch>=2.10.0
+Requires-Dist: tqdm>=4.67.3
+Requires-Dist: yfinance>=1.2.0
+
+# Signature MMD Two-Sample Statistical Tests
+
+## Andrew Alden, Blanka Horvath, Zacharia Issa
