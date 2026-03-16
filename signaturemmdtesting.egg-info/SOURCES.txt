@@ -8,6 +8,7 @@ signaturemmdtesting.egg-info/requires.txt
 signaturemmdtesting.egg-info/top_level.txt
 src/mmd/__init__.py
 src/mmd/cuda_backend.py
+src/mmd/cython_backend.pyi
 src/mmd/distribution_functions.py
 src/mmd/level_functions.py
 src/mmd/mmd.py

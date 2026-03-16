@@ -196,7 +196,7 @@ class SigKernel:
             pad,
         )
 
-    def compute_mmd(self, X, Y, estimator="ub", u_stat=False, pad=True):
+    def compute_mmd(self, X, Y, estimator="ub", u_stat=False, pad=True, chunk_size=128):
         """
          Corresponds to Algorithm 3 or 5 in "Higher Order Kernel Mean Embeddings to Capture Filtrations of Stochastic Processes"
          Input:
@@ -214,9 +214,43 @@ class SigKernel:
             "the estimator should be 'b' or 'ub' "
         )
 
-        K_XX = self.compute_Gram(X, X, sym=True, pad=pad)
-        K_YY = self.compute_Gram(Y, Y, sym=True, pad=pad)
-        K_XY = self.compute_Gram(X, Y, sym=False, pad=pad)
+        nx, ny = X.shape[0], Y.shape[0]
+        K_XX = torch.zeros(nx, nx, dtype=X.dtype, device=X.device)
+        K_YY = torch.zeros(ny, ny, dtype=Y.dtype, device=Y.device)
+        K_XY = torch.zeros(nx, ny, dtype=X.dtype, device=X.device)
+
+        if chunk_size is None or chunk_size <= 0:
+            K_XX = self.compute_Gram(X, X, sym=True, pad=pad)
+            K_YY = self.compute_Gram(Y, Y, sym=True, pad=pad)
+            K_XY = self.compute_Gram(X, Y, sym=False, pad=pad)
+        else:
+            # Block-wise computation to limit VRAM usage
+            for i in range(0, nx, chunk_size):
+                for j in range(0, nx, chunk_size):
+                    if i <= j:
+                        b_X1 = X[i:i+chunk_size]
+                        b_X2 = X[j:j+chunk_size]
+                        block = self.compute_Gram(b_X1, b_X2, sym=(i == j), pad=pad)
+                        K_XX[i:i+chunk_size, j:j+chunk_size] = block
+                        if i != j:
+                            K_XX[j:j+chunk_size, i:i+chunk_size] = block.t()
+
+            for i in range(0, ny, chunk_size):
+                for j in range(0, ny, chunk_size):
+                    if i <= j:
+                        b_Y1 = Y[i:i+chunk_size]
+                        b_Y2 = Y[j:j+chunk_size]
+                        block = self.compute_Gram(b_Y1, b_Y2, sym=(i == j), pad=pad)
+                        K_YY[i:i+chunk_size, j:j+chunk_size] = block
+                        if i != j:
+                            K_YY[j:j+chunk_size, i:i+chunk_size] = block.t()
+
+            for i in range(0, nx, chunk_size):
+                for j in range(0, ny, chunk_size):
+                    b_X = X[i:i+chunk_size]
+                    b_Y = Y[j:j+chunk_size]
+                    block = self.compute_Gram(b_X, b_Y, sym=False, pad=pad)
+                    K_XY[i:i+chunk_size, j:j+chunk_size] = block
 
         if estimator == "b":
             return torch.mean(K_XX) + torch.mean(K_YY) - 2 * torch.mean(K_XY)
