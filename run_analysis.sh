@@ -1,19 +1,19 @@
 #!/bin/bash
 #
 #SBATCH --job-name=hawkes_analysis
-#SBATCH --output=/raid/home/students/regna_enz/SignatureMMDTesting/out_hawkes.out
-#SBATCH --error=/raid/home/students/regna_enz/SignatureMMDTesting/out_hawkes.out
+#SBATCH --output=/raid/home/students/regna_enz/SignatureMMDTesting/out_hawkes_kernel.out
+#SBATCH --error=/raid/home/students/regna_enz/SignatureMMDTesting/out_hawkes_kernel.out
 
 ## Mails
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=%VOTRE_EMAIL%
 
-#SBATCH --partition=prod40
+#SBATCH --partition=prod10
 
-## 3g.40gb:1 pour prod40
-#SBATCH --gres=gpu:nvidia_a100_3g.40gb:1
+## 1g.10gb:1 pour prod10
+#SBATCH --gres=gpu:nvidia_a100_1g.10gb:1
 
-## total requested cpus (ntasks * cpus-per-task) must be in [1: 4 * nb_3g.40gb]
+## total requested cpus (ntasks * cpus-per-task) must be in [1: 4 * nb_1g.10gb]
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=24:0:0
@@ -25,4 +25,5 @@ source /raid/home/students/regna_enz/SignatureMMDTesting/.venv/bin/activate
 cd /raid/home/students/regna_enz/SignatureMMDTesting
 
 ## Lancer le script
-python run_alpha4_scaling.py
+export PYTHONUNBUFFERED=1
+uv run kernel_comp_opt.py
