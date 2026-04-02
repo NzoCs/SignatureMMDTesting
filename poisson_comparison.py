@@ -38,13 +38,13 @@ class PoissonComparisonConfig:
 
     # Sweep over ratio λ1/λ0
     ratios: List[float] = field(default_factory=lambda: [0.5, 0.7, 0.8, 0.9, 0.95, 1.0, 1.05, 1.1, 1.2, 1.3, 1.5, 2.0])
-    scalings: List[float] = field(default_factory=lambda: [0.5, 1.0, 2.0, 3.0, 4.0])
+    scalings: List[float] = field(default_factory=lambda: [0.1, 0.25, 0.5, 1.0, 2.0])
 
     # Execution
     n_atoms_delta: int = 500
     n_paths: int = 256
     n_bank: int = 1024
-    num_rep: int = 1
+    num_rep: int = 10
     alpha_test: float = 0.05
 
     # Kernel choice
@@ -173,9 +173,12 @@ def compute_errors_from_gram(K_h0, K_h1, K_h0h1, n_atoms, batch_size, alpha_test
     crit2 = np.sort(h00_dists)[int(n_atoms * (1 - alpha_test))]
     t1e   = 100.0 * np.mean(h01_dists <= crit2)
 
-    raw = (h0_dists, h1_dists, h00_dists, h01_dists)
-    return 100.0 - t1e, t2e, raw
+    h0_sorted = np.sort(h0_dists)
+    p_val_arr = (n_atoms - np.searchsorted(h0_sorted, h1_dists, side='left')) / n_atoms
+    mean_pval = np.mean(p_val_arr)
 
+    raw = (h0_dists, h1_dists, h00_dists, h01_dists)
+    return 100.0 - t1e, t2e, mean_pval, raw
 
 # ---------------------------------------------------------------------------
 # Sweep & Plotting
@@ -183,6 +186,7 @@ def compute_errors_from_gram(K_h0, K_h1, K_h0h1, n_atoms, batch_size, alpha_test
 def execute_sweep(config: PoissonComparisonConfig):
     results_t1e = {s: {r: [] for r in config.ratios} for s in config.scalings}
     results_t2e = {s: {r: [] for r in config.ratios} for s in config.scalings}
+    results_pval = {s: {r: [] for r in config.ratios} for s in config.scalings}
     pooled_raw  = {s: {r: {'h0': [], 'h1': [], 'h00': [], 'h01': []}
                        for r in config.ratios} for s in config.scalings}
 
@@ -197,12 +201,13 @@ def execute_sweep(config: PoissonComparisonConfig):
                 K_h1   = precompute_gram_chunked(scaled_kernel, h1, h1, sym=True)
                 K_h0h1 = precompute_gram_chunked(scaled_kernel, h0, h1, sym=False)
 
-                t1e, t2e, raw = compute_errors_from_gram(
+                t1e, t2e, mean_pval, raw = compute_errors_from_gram(
                     K_h0, K_h1, K_h0h1,
                     config.n_atoms_delta, config.n_paths, config.alpha_test)
 
                 results_t1e[scal][ratio].append(t1e)
                 results_t2e[scal][ratio].append(t2e)
+                results_pval[scal][ratio].append(mean_pval)
 
                 h0_d, h1_d, h00_d, h01_d = raw
                 pooled_raw[scal][ratio]['h0'].append(h0_d)
@@ -215,6 +220,7 @@ def execute_sweep(config: PoissonComparisonConfig):
     # Pooled errors
     pooled_t1e = {s: {} for s in config.scalings}
     pooled_t2e = {s: {} for s in config.scalings}
+    pooled_pval = {s: {} for s in config.scalings}
     for scal in config.scalings:
         for ratio in config.ratios:
             a0  = np.concatenate(pooled_raw[scal][ratio]['h0'])
@@ -222,12 +228,16 @@ def execute_sweep(config: PoissonComparisonConfig):
             a00 = np.concatenate(pooled_raw[scal][ratio]['h00'])
             a01 = np.concatenate(pooled_raw[scal][ratio]['h01'])
             n = len(a0)
-            c1 = np.sort(a0)[int(n * (1 - config.alpha_test))]
+            sorted_a0 = np.sort(a0)
+            c1 = sorted_a0[int(n * (1 - config.alpha_test))]
             c2 = np.sort(a00)[int(n * (1 - config.alpha_test))]
             pooled_t2e[scal][ratio] = 100.0 * np.mean(a1 <= c1)
             pooled_t1e[scal][ratio] = 100.0 - 100.0 * np.mean(a01 <= c2)
+            
+            p_vals_pooled = (n - np.searchsorted(sorted_a0, a1, side='left')) / n
+            pooled_pval[scal][ratio] = np.mean(p_vals_pooled)
 
-    return results_t1e, results_t2e, pooled_t1e, pooled_t2e
+    return results_t1e, results_t2e, results_pval, pooled_t1e, pooled_t2e, pooled_pval
 
 
 def plot_per_rep(results_t1e, results_t2e, config, save_dir):
@@ -301,6 +311,49 @@ def plot_pooled(pooled_t1e, pooled_t2e, config, save_dir):
     logging.info(f"Saved pooled plot to {save_dir}/")
 
 
+def plot_pvalues(results_pval, pooled_pval, config, save_dir):
+    rs = np.array(config.ratios)
+    colors = plt.cm.viridis(np.linspace(0, 0.9, len(config.scalings)))
+    
+    # 1. Per rep figure
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for scal, color in zip(config.scalings, colors):
+        means_p = np.array([np.mean(results_pval[scal][r]) for r in rs])
+        stds_p  = np.array([np.std(results_pval[scal][r]) for r in rs])
+        ax.plot(rs, means_p, label=f"Scale: {scal}", color=color, marker='o')
+        ax.fill_between(rs, means_p - stds_p, means_p + stds_p, color=color, alpha=0.2)
+        
+    ax.axvline(x=1.0, color='grey', linestyle=':', alpha=0.5, label=r'$\lambda_1/\lambda_0=1$')
+    ax.set_xlabel(r"$\lambda_1 / \lambda_0$", fontsize=12)
+    ax.set_ylabel("Empirical P-value", fontsize=12)
+    ax.set_title(f"Per-Rep Mean P-value ({config.num_rep} reps)", fontsize=13)
+    ax.legend(title="Scaling", fontsize=10)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "poisson_comparison_pvalues_per_rep.svg"), format="svg")
+    plt.close()
+
+    # 2. Pooled figure
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for scal, color in zip(config.scalings, colors):
+        pt_p = np.array([pooled_pval[scal][r] for r in rs])
+        ax.plot(rs, pt_p, label=f"Scale: {scal}", color=color, marker='s')
+        
+    ax.axvline(x=1.0, color='grey', linestyle=':', alpha=0.5, label=r'$\lambda_1/\lambda_0=1$')
+    ax.set_xlabel(r"$\lambda_1 / \lambda_0$", fontsize=12)
+    ax.set_ylabel("Pooled Empirical P-value", fontsize=12)
+    ax.set_title(f"Pooled P-value vs Ratio", fontsize=13)
+    ax.legend(title="Scaling", fontsize=10)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "poisson_comparison_pvalues_pooled.svg"), format="svg")
+    plt.close()
+    
+    logging.info(f"Saved separated p-values plots to {save_dir}/")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -314,10 +367,11 @@ def main():
     kernel_dir = os.path.join(config.data_dir, config.kernel_type)
     os.makedirs(kernel_dir, exist_ok=True)
 
-    results_t1e, results_t2e, pooled_t1e, pooled_t2e = execute_sweep(config)
+    results_t1e, results_t2e, results_pval, pooled_t1e, pooled_t2e, pooled_pval = execute_sweep(config)
 
     plot_per_rep(results_t1e, results_t2e, config, kernel_dir)
     plot_pooled(pooled_t1e, pooled_t2e, config, kernel_dir)
+    plot_pvalues(results_pval, pooled_pval, config, kernel_dir)
 
     with open(os.path.join(kernel_dir, "metadata.json"), "w") as f:
         json.dump(config.__dict__, f, indent=4)

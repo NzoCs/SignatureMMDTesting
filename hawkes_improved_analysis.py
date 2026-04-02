@@ -40,7 +40,7 @@ class ExperimentConfig:
     
     # Sweep configurations
     alphas_h1: List[float] = field(default_factory=lambda: np.linspace(2, 8, 7).tolist())
-    scalings: List[float] = field(default_factory=lambda: [0.5, 1.0, 2.0, 3.0, 4.0])
+    scalings: List[float] = field(default_factory=lambda: [0.1, 0.25, 0.5, 1.0, 2.0])
     
     # Execution parameters
     n_atoms_delta: int = 1000   # cheap with Gram precomputation, can be large
@@ -251,9 +251,14 @@ def compute_errors_from_gram(K_h0, K_h1, K_h0h1, n_atoms, batch_size, alpha_test
     crit2 = np.sort(h00_dists)[int(n_atoms * (1 - alpha_test))]
     t1e = 100.0 * np.mean(h01_dists <= crit2)
     
+    # P-value for H0 vs H1
+    h0_sorted = np.sort(h0_dists)
+    p_values = (n_atoms - np.searchsorted(h0_sorted, h1_dists, side='left')) / n_atoms
+    mean_pval = np.mean(p_values)
+    
     # Return errors AND raw distributions for pooling
     raw = (h0_dists, h1_dists, h00_dists, h01_dists)
-    return 100.0 - t1e, t2e, raw
+    return 100.0 - t1e, t2e, mean_pval, raw
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +275,7 @@ def execute_sweep_multi_scaling(config: ExperimentConfig):
     """
     results_t1e = {s: {a: [] for a in config.alphas_h1} for s in config.scalings}
     results_t2e = {s: {a: [] for a in config.alphas_h1} for s in config.scalings}
+    results_pval = {s: {a: [] for a in config.alphas_h1} for s in config.scalings}
     
     # Accumulate raw MMD distributions across all reps for pooled test
     pooled_raw = {s: {a: {'h0': [], 'h1': [], 'h00': [], 'h01': []} 
@@ -290,7 +296,7 @@ def execute_sweep_multi_scaling(config: ExperimentConfig):
                 K_h0h1 = precompute_gram_chunked(scaled_kernel, h0, h1, sym=False)
                 
                 # Sub-sample from precomputed Grams — virtually free
-                t1e, t2e, raw = compute_errors_from_gram(
+                t1e, t2e, mean_pval, raw = compute_errors_from_gram(
                     K_h0, K_h1, K_h0h1,
                     n_atoms=config.n_atoms_delta,
                     batch_size=config.n_paths,
@@ -299,6 +305,7 @@ def execute_sweep_multi_scaling(config: ExperimentConfig):
                 
                 results_t1e[scal][alpha].append(t1e)
                 results_t2e[scal][alpha].append(t2e)
+                results_pval[scal][alpha].append(mean_pval)
                 
                 # Accumulate raw MMD values for pooled global test
                 h0_d, h1_d, h00_d, h01_d = raw
@@ -312,6 +319,7 @@ def execute_sweep_multi_scaling(config: ExperimentConfig):
     # Compute pooled errors from ALL accumulated MMD values
     pooled_t1e = {s: {} for s in config.scalings}
     pooled_t2e = {s: {} for s in config.scalings}
+    pooled_pval = {s: {} for s in config.scalings}
     
     for scal in config.scalings:
         for alpha in config.alphas_h1:
@@ -321,20 +329,28 @@ def execute_sweep_multi_scaling(config: ExperimentConfig):
             all_h01 = np.concatenate(pooled_raw[scal][alpha]['h01'])
             
             n_total = len(all_h0)
-            crit = np.sort(all_h0)[int(n_total * (1 - config.alpha_test))]
+            sorted_all_h0 = np.sort(all_h0)
+            
+            # Type 2 Error
+            crit = sorted_all_h0[int(n_total * (1 - config.alpha_test))]
             t2e = 100.0 * np.mean(all_h1 <= crit)
             
+            # Type 1 Error
             crit2 = np.sort(all_h00)[int(n_total * (1 - config.alpha_test))]
             t1e = 100.0 * np.mean(all_h01 <= crit2)
             
+            # Empirical P-value
+            p_vals = (n_total - np.searchsorted(sorted_all_h0, all_h1, side='left')) / n_total
+            
             pooled_t1e[scal][alpha] = 100.0 - t1e
             pooled_t2e[scal][alpha] = t2e
+            pooled_pval[scal][alpha] = np.mean(p_vals)
     
     total_paths = config.num_rep * config.n_bank
     total_atoms = config.num_rep * config.n_atoms_delta
     logging.info(f"Pooled test: {total_paths} total independent paths, {total_atoms} MMD values per (alpha, scaling)")
     
-    return results_t1e, results_t2e, pooled_t1e, pooled_t2e
+    return results_t1e, results_t2e, results_pval, pooled_t1e, pooled_t2e, pooled_pval
 
 
 def plot_sweep_multi_scaling(results_t1e, results_t2e, config: ExperimentConfig, save_dir: str):
@@ -355,6 +371,7 @@ def plot_sweep_multi_scaling(results_t1e, results_t2e, config: ExperimentConfig,
         axes[1].fill_between(alphas, means_t2 - stds_t2, means_t2 + stds_t2, color=color, alpha=0.2)
         
     axes[0].axhline(y=5.0, color='r', linestyle='--', label='5% Target')
+    axes[0].axvline(x=config.alpha0, color='grey', linestyle='--', label=f'alpha_1={config.alpha0} (H1 = H0)')
         
     axes[0].set_xlabel(r"$\alpha_1$ (with $\mu_1 = 100 - 10\alpha_1$)", fontsize=12)
     axes[0].set_ylabel("P[Type 1 Error] (%)", fontsize=12)
@@ -362,6 +379,7 @@ def plot_sweep_multi_scaling(results_t1e, results_t2e, config: ExperimentConfig,
     axes[0].legend(title="Scaling", fontsize=10)
     axes[0].grid(True, linestyle='--', alpha=0.6)
     
+    axes[1].axvline(x=config.alpha0, color='grey', linestyle='--', label=f'alpha_1={config.alpha0} (H1 = H0)')
     axes[1].set_xlabel(r"$\alpha_1$ (with $\mu_1 = 100 - 10\alpha_1$)", fontsize=12)
     axes[1].set_ylabel("P[Type 2 Error] (%)", fontsize=12)
     axes[1].set_title(f"Type 2 Error vs Alpha ({config.num_rep} reps, {config.n_bank} paths/rep)", fontsize=13)
@@ -391,6 +409,7 @@ def plot_sweep_pooled(pooled_t1e, pooled_t2e, config: ExperimentConfig, save_dir
         axes[1].plot(alphas, pt2, label=f"Scale: {scal}", color=color, marker='s')
         
     axes[0].axhline(y=5.0, color='r', linestyle='--', label='5% Target')
+    axes[0].axvline(x=config.alpha0, color='grey', linestyle='--', label=f'alpha_1={config.alpha0} (H1 = H0)')
         
     axes[0].set_xlabel(r"$\alpha_1$ (with $\mu_1 = 100 - 10\alpha_1$)", fontsize=12)
     axes[0].set_ylabel("Pooled P[Type 1 Error] (%)", fontsize=12)
@@ -398,6 +417,7 @@ def plot_sweep_pooled(pooled_t1e, pooled_t2e, config: ExperimentConfig, save_dir
     axes[0].legend(title="Scaling", fontsize=10)
     axes[0].grid(True, linestyle='--', alpha=0.6)
     
+    axes[1].axvline(x=config.alpha0, color='grey', linestyle='--', label=f'alpha_1={config.alpha0} (H1 = H0)')
     axes[1].set_xlabel(r"$\alpha_1$ (with $\mu_1 = 100 - 10\alpha_1$)", fontsize=12)
     axes[1].set_ylabel("Pooled P[Type 2 Error] (%)", fontsize=12)
     axes[1].set_title(f"Pooled Global: Type 2 Error ({total_paths} paths, {total_atoms} MMD samples)", fontsize=13)
@@ -408,6 +428,49 @@ def plot_sweep_pooled(pooled_t1e, pooled_t2e, config: ExperimentConfig, save_dir
     plt.savefig(os.path.join(save_dir, "errors_vs_alpha_multi_scaling_pooled.svg"), format="svg")
     plt.close()
     logging.info(f"Saved pooled plot to {save_dir}/")
+
+
+def plot_sweep_pvalues(results_pval, pooled_pval, config: ExperimentConfig, save_dir: str):
+    alphas = np.array(config.alphas_h1)
+    colors = plt.cm.viridis(np.linspace(0, 0.9, len(config.scalings)))
+    
+    # 1. Per rep figure
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for scal, color in zip(config.scalings, colors):
+        means_p = np.array([np.mean(results_pval[scal][a]) for a in alphas])
+        stds_p  = np.array([np.std(results_pval[scal][a]) for a in alphas])
+        ax.plot(alphas, means_p, label=f"Scale: {scal}", color=color, marker='o')
+        ax.fill_between(alphas, means_p - stds_p, means_p + stds_p, color=color, alpha=0.2)
+        
+    ax.axvline(x=config.alpha0, color='grey', linestyle='--', label=f'alpha_1={config.alpha0} (H1 = H0)')
+    ax.set_xlabel(r"$\alpha_1$ (with $\mu_1 = 100 - 10\alpha_1$)", fontsize=12)
+    ax.set_ylabel("Empirical P-value", fontsize=12)
+    ax.set_title(f"Per-Rep Mean P-value vs Alpha ({config.num_rep} reps)", fontsize=13)
+    ax.legend(title="Scaling", fontsize=10)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "empirical_pvalues_per_rep.svg"), format="svg")
+    plt.close()
+
+    # 2. Pooled figure
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for scal, color in zip(config.scalings, colors):
+        pt_p = np.array([pooled_pval[scal][a] for a in alphas])
+        ax.plot(alphas, pt_p, label=f"Scale: {scal}", color=color, marker='s')
+        
+    ax.axvline(x=config.alpha0, color='grey', linestyle='--', label=f'alpha_1={config.alpha0} (H1 = H0)')
+    ax.set_xlabel(r"$\alpha_1$ (with $\mu_1 = 100 - 10\alpha_1$)", fontsize=12)
+    ax.set_ylabel("Pooled Empirical P-value", fontsize=12)
+    ax.set_title(f"Pooled P-value vs Alpha", fontsize=13)
+    ax.legend(title="Scaling", fontsize=10)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "empirical_pvalues_pooled.svg"), format="svg")
+    plt.close()
+    
+    logging.info(f"Saved separated p-values plots to {save_dir}/")
 
 
 # ---------------------------------------------------------------------------
@@ -425,13 +488,16 @@ def main():
     os.makedirs(kernel_dir, exist_ok=True)
     
     logging.info("Executing sweep over parameters for multiple scalings...")
-    results_t1e, results_t2e, pooled_t1e, pooled_t2e = execute_sweep_multi_scaling(config)
+    results_t1e, results_t2e, results_pval, pooled_t1e, pooled_t2e, pooled_pval = execute_sweep_multi_scaling(config)
     
     # Plot 1: per-rep mean ± std (confidence intervals)
     plot_sweep_multi_scaling(results_t1e, results_t2e, config, kernel_dir)
     
     # Plot 2: pooled global test (all reps combined)
     plot_sweep_pooled(pooled_t1e, pooled_t2e, config, kernel_dir)
+    
+    # Plot 3: p-values
+    plot_sweep_pvalues(results_pval, pooled_pval, config, kernel_dir)
     
     with open(os.path.join(kernel_dir, "metadata.json"), "w") as f:
         json.dump(config.__dict__, f, indent=4)
