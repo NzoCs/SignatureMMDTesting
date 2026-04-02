@@ -44,7 +44,7 @@ class PoissonComparisonConfig:
     n_atoms_delta: int = 500
     n_paths: int = 256
     n_bank: int = 1024
-    num_rep: int = 10
+    num_rep: int = 1
     alpha_test: float = 0.05
 
     # Kernel choice
