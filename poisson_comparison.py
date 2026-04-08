@@ -33,17 +33,17 @@ class PoissonComparisonConfig:
 
     # Poisson parameters
     lambda0: float = 100.0  # H0 rate
-    T: float = 10.0
-    grid_points: int = 300
+    T: float = 1.0
+    grid_points: int = 100
 
     # Sweep over ratio λ1/λ0
     ratios: List[float] = field(default_factory=lambda: [0.5, 0.7, 0.8, 0.9, 0.95, 1.0, 1.05, 1.1, 1.2, 1.3, 1.5, 2.0])
-    scalings: List[float] = field(default_factory=lambda: [0.1, 0.25, 0.5, 1.0, 2.0])
+    scalings: List[float] = field(default_factory=lambda: [0.1, 0.25, 0.5, 1.0])
 
     # Execution
     n_atoms_delta: int = 500
-    n_paths: int = 256
-    n_bank: int = 1024
+    n_paths: int = 128
+    n_bank: int = 512
     num_rep: int = 10
     alpha_test: float = 0.05
 
@@ -116,7 +116,7 @@ def load_poisson_paths(config: PoissonComparisonConfig, num_sim: int, ratio: flo
 # ---------------------------------------------------------------------------
 # Gram precomputation
 # ---------------------------------------------------------------------------
-def precompute_gram_chunked(sig_kernel, X, Y, sym=False, chunk_size=32):
+def precompute_gram_chunked(sig_kernel, X, Y, sym=False, chunk_size=128):
     nx, ny = X.shape[0], Y.shape[0]
     K = torch.zeros(nx, ny, dtype=X.dtype, device=X.device)
     for i in range(0, nx, chunk_size):

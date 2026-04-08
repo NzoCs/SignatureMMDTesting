@@ -387,14 +387,12 @@ def plot_per_rep(results_t1e, results_t2e, config, save_dir):
         axes[1].fill_between(xs, m2 - s2, m2 + s2, color=color, alpha=0.2)
 
     axes[0].axhline(y=5.0, color='r', linestyle='--', label='5% Target')
-    axes[0].axvline(x=5.0, color='grey', linestyle=':', label="Equal branching ratio")
     axes[0].set_xlabel(r"H1 base intensity $\alpha_1$", fontsize=12)
     axes[0].set_ylabel("P[Type 1 Error] (%)", fontsize=12)
     axes[0].set_title(f"Type 1 Error — PL vs Exp ({config.num_rep} reps)", fontsize=13)
     axes[0].legend(title="Scaling", fontsize=10)
     axes[0].grid(True, linestyle='--', alpha=0.6)
 
-    axes[1].axvline(x=5.0, color='grey', linestyle=':', label="Equal branching ratio")
     axes[1].set_xlabel(r"H1 base intensity $\alpha_1$", fontsize=12)
     axes[1].set_ylabel("P[Type 2 Error] (%)", fontsize=12)
     axes[1].set_title(f"Type 2 Error — PL vs Exp ({config.num_rep} reps)", fontsize=13)
@@ -421,14 +419,12 @@ def plot_pooled(pooled_t1e, pooled_t2e, config, save_dir):
         axes[1].plot(xs, pt2, label=f"Scale: {scal}", color=color, marker='s')
 
     axes[0].axhline(y=5.0, color='r', linestyle='--', label='5% Target')
-    axes[0].axvline(x=5.0, color='grey', linestyle=':')
     axes[0].set_xlabel(r"H1 base intensity $\alpha_1$", fontsize=12)
     axes[0].set_ylabel("Pooled P[Type 1 Error] (%)", fontsize=12)
     axes[0].set_title(f"Pooled: Type 1 Error ({total_paths} paths, {total_atoms} MMD)", fontsize=13)
     axes[0].legend(title="Scaling", fontsize=10)
     axes[0].grid(True, linestyle='--', alpha=0.6)
 
-    axes[1].axvline(x=5.0, color='grey', linestyle=':')
     axes[1].set_xlabel(r"H1 base intensity $\alpha_1$", fontsize=12)
     axes[1].set_ylabel("Pooled P[Type 2 Error] (%)", fontsize=12)
     axes[1].set_title(f"Pooled: Type 2 Error ({total_paths} paths, {total_atoms} MMD)", fontsize=13)
@@ -453,7 +449,6 @@ def plot_pvalues(results_pval, pooled_pval, config, save_dir):
         ax.plot(xs, means_p, label=f"Scale: {scal}", color=color, marker='o')
         ax.fill_between(xs, means_p - stds_p, means_p + stds_p, color=color, alpha=0.2)
         
-    ax.axvline(x=5.0, color='grey', linestyle=':', label="Equal branching ratio")
     ax.set_xlabel(r"H1 base intensity $\alpha_1$", fontsize=12)
     ax.set_ylabel("Empirical P-value", fontsize=12)
     ax.set_title(f"Per-Rep Mean P-value ({config.num_rep} reps)", fontsize=13)
@@ -470,7 +465,6 @@ def plot_pvalues(results_pval, pooled_pval, config, save_dir):
         pt_p = np.array([pooled_pval[scal][x] for x in xs])
         ax.plot(xs, pt_p, label=f"Scale: {scal}", color=color, marker='s')
         
-    ax.axvline(x=5.0, color='grey', linestyle=':', label="Equal branching ratio")
     ax.set_xlabel(r"H1 base intensity $\alpha_1$", fontsize=12)
     ax.set_ylabel("Pooled Empirical P-value", fontsize=12)
     ax.set_title(f"Pooled P-value vs Alpha", fontsize=13)

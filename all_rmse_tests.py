@@ -112,16 +112,15 @@ def sim_poisson_events(lam, num_sim, T):
         all_events.append(np.array(events))
     return all_events
 
-def calc_rmse_poisson(events, lam_pred):
+def calc_rmse_poisson(events, lam_pred, lam_ref):
     mse_list = []
     for ev in events:
         if len(ev) < 2: continue
         inter_arrival = np.diff(np.insert(ev, 0, 0.0))
-        predicted_inter_arrival = 1.0 / lam_pred
-        mse_list.append(np.mean((inter_arrival - predicted_inter_arrival)**2))
+        predicted_ia = 1.0 / lam_pred
+        ref_ia       = 1.0 / lam_ref        # dénominateur fixe = H0
+        mse_list.append(np.mean(((inter_arrival - predicted_ia) / ref_ia) ** 2))
     return np.sqrt(np.mean(mse_list)) if mse_list else 0.0
-
-
 # --- Hawkes ---
 
 # Kernel
@@ -233,35 +232,46 @@ def expected_interarrival_poly(events_history, t_curr, mu, alpha, beta, p):
     val, _ = integrate.quad(survivor, 0, np.inf, epsabs=1e-3, epsrel=1e-3)
     return val
 
-# RMSE Calculators
-def calc_rmse_hawkes_exp(events_list, mu1, alpha1, beta):
+def calc_rmse_hawkes_exp(events_list, mu_eval, alpha_eval, beta_eval,
+                          mu_ref=None, alpha_ref=None, beta_ref=None):
+    # Si pas de ref fournie, auto-normalisation (comportement ancien)
+    if mu_ref is None:
+        mu_ref, alpha_ref, beta_ref = mu_eval, alpha_eval, beta_eval
+
     mse_all = []
     for events in events_list:
         if len(events) < 5: continue
         squared_errors = []
-        Sn = 0.0
+        Sn_eval = 0.0
+        Sn_ref  = 0.0
         for i in range(1, len(events)):
-            t_prev = events[i-1]
-            t_curr = events[i]
-            E_dt = expected_interarrival_exp(Sn, mu1, beta)
-            actual_dt = t_curr - t_prev
-            squared_errors.append((actual_dt - E_dt)**2)
-            Sn = Sn * np.exp(-beta * actual_dt) + alpha1
+            actual_dt = events[i] - events[i-1]
+            E_dt_eval = expected_interarrival_exp(Sn_eval, mu_eval, beta_eval)
+            E_dt_ref  = expected_interarrival_exp(Sn_ref,  mu_ref,  beta_ref)
+            squared_errors.append(((actual_dt - E_dt_eval) / E_dt_ref) ** 2)
+            Sn_eval = Sn_eval * np.exp(-beta_eval * actual_dt) + alpha_eval
+            Sn_ref  = Sn_ref  * np.exp(-beta_ref  * actual_dt) + alpha_ref
         mse_all.append(np.mean(squared_errors))
     return np.sqrt(np.mean(mse_all)) if mse_all else 0.0
 
-def calc_rmse_hawkes_poly(events_list, mu, alpha, beta, p):
+
+def calc_rmse_hawkes_poly(events_list, mu_eval, alpha_eval, beta_eval, p_eval,
+                           mu_ref=None, alpha_ref=None, beta_ref=None, p_ref=None):
+    if mu_ref is None:
+        mu_ref, alpha_ref, beta_ref, p_ref = mu_eval, alpha_eval, beta_eval, p_eval
+
     mse_all = []
     for events in events_list:
         if len(events) < 5: continue
         squared_errors = []
         for i in range(1, len(events)):
             history = events[:i]
-            t_curr = events[i-1]
-            t_next = events[i]
-            E_dt = expected_interarrival_poly(history, t_curr, mu, alpha, beta, p)
+            t_curr  = events[i-1]
+            t_next  = events[i]
             actual_dt = t_next - t_curr
-            squared_errors.append((actual_dt - E_dt)**2)
+            E_dt_eval = expected_interarrival_poly(history, t_curr, mu_eval, alpha_eval, beta_eval, p_eval)
+            E_dt_ref  = expected_interarrival_poly(history, t_curr, mu_ref,  alpha_ref,  beta_ref,  p_ref)
+            squared_errors.append(((actual_dt - E_dt_eval) / E_dt_ref) ** 2)
         mse_all.append(np.mean(squared_errors))
     return np.sqrt(np.mean(mse_all)) if mse_all else 0.0
 
@@ -277,11 +287,11 @@ def run_poisson(ax):
     logging.info("Running Poisson RMSE comparison...")
     for rep in tqdm(range(config.num_rep), desc="Poisson Repetitions"):
         events_h0 = sim_poisson_events(config.lambda0, config.n_bank, config.T)
-        rmse_h0 = calc_rmse_poisson(events_h0, config.lambda0)
+        rmse_h0 = calc_rmse_poisson(events_h0, config.lambda0, config.lambda0)
         
         for i, ratio in enumerate(config.ratios):
             lam1 = config.lambda1(ratio)
-            rmse_h1 = calc_rmse_poisson(events_h0, lam1)
+            rmse_h1 = calc_rmse_poisson(events_h0, lam1, config.lambda0)
             
             results_h0_pred[rep, i] = rmse_h0
             results_h1_pred[rep, i] = rmse_h1
@@ -297,7 +307,7 @@ def run_poisson(ax):
     ax.fill_between(config.ratios, m_h1 - s_h1, m_h1 + s_h1, alpha=0.2)
     ax.axvline(1.0, color='grey', linestyle='--', label='Ratio=1.0 (H1 = H0)')
     ax.set_xlabel('lambda1 / lambda0')
-    ax.set_ylabel('RMSE evaluated on H0')
+    ax.set_ylabel('Relative RMSE (scale-invariant)')
     ax.set_title('Poisson: H0 vs H1 Predictors')
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -333,7 +343,7 @@ def run_hawkes_opt(ax):
     ax.plot(config.alphas_h1, m_h1, marker='s', label='H1 Predictor (Exp)')
     ax.fill_between(config.alphas_h1, m_h1 - s_h1, m_h1 + s_h1, alpha=0.2)
     ax.set_xlabel('H1 base intensity alpha_1')
-    ax.set_ylabel('RMSE evaluated on H0 (Power-law)')
+    ax.set_ylabel('Relative RMSE (scale-invariant)')
     ax.set_title('Hawkes (Opt): Power vs Exp')
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -370,7 +380,7 @@ def run_hawkes_kernel(ax):
     ax.plot(config.p_values, m_h1, marker='s', label='H1 Predictor (Power-law)')
     ax.fill_between(config.p_values, m_h1 - s_h1, m_h1 + s_h1, alpha=0.2)
     ax.set_xlabel('Power-law exponent p')
-    ax.set_ylabel('RMSE evaluated on H0 (Exp)')
+    ax.set_ylabel('Relative RMSE (scale-invariant)')
     ax.set_title('Hawkes (Kernel): Exp vs Power')
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -407,7 +417,7 @@ def run_hawkes_improved(ax):
     ax.fill_between(config.alphas_h1, m_h1 - s_h1, m_h1 + s_h1, alpha=0.2)
     ax.axvline(config.alpha0, color='grey', linestyle='--', label=f'alpha_1={config.alpha0} (H1 = H0)')
     ax.set_xlabel('H1 base intensity alpha_1')
-    ax.set_ylabel('RMSE evaluated on H0')
+    ax.set_ylabel('Relative RMSE (scale-invariant)')
     ax.set_title('Hawkes (Improved): Fixed beta, varying alpha')
     ax.legend()
     ax.grid(True, alpha=0.3)

@@ -1,8 +1,8 @@
 #!/bin/bash
 #
 #SBATCH --job-name=hawkes_analysis
-#SBATCH --output=/raid/home/students/regna_enz/SignatureMMDTesting/out4.out
-#SBATCH --error=/raid/home/students/regna_enz/SignatureMMDTesting/out4.out
+#SBATCH --output=/raid/home/students/regna_enz/SignatureMMDTesting/out.out
+#SBATCH --error=/raid/home/students/regna_enz/SignatureMMDTesting/out.out
 
 ## Mails
 #SBATCH --mail-type=ALL
@@ -16,7 +16,7 @@
 ## total requested cpus (ntasks * cpus-per-task) must be in [1: 4 * nb_1g.10gb]
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --time=24:0:0
+#SBATCH --time=48:0:0
 
 ## Activer l'environnement virtuel
 source /raid/home/students/regna_enz/SignatureMMDTesting/.venv/bin/activate
@@ -26,4 +26,4 @@ cd /raid/home/students/regna_enz/SignatureMMDTesting
 
 ## Lancer le script
 export PYTHONUNBUFFERED=1
-uv run poisson_comparison.py
+uv run hawkes_kernel_comparison.py

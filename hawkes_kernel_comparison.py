@@ -39,11 +39,11 @@ class KernelComparisonConfig:
     beta: float = 10.0
     T: float = 10.0
     burn_in: float = 10.0
-    grid_points: int = 300
+    grid_points: int = 200
 
     # Sweep over power-law exponent p
     p_values: List[float] = field(default_factory=lambda: [1.5, 2.0, 3.0, 5.0, 8.0])
-    scalings: List[float] = field(default_factory=lambda: [0.1, 0.25, 0.5, 1.0, 2.0])
+    scalings: List[float] = field(default_factory=lambda: [1.0])
 
     # Execution
     n_atoms_delta: int = 1000
@@ -91,8 +91,70 @@ def powerlaw_kernel(alpha, beta, p):
 
 
 # ---------------------------------------------------------------------------
-# Hawkes simulator (general, Ogata thinning)
+# Hawkes simulators
 # ---------------------------------------------------------------------------
+class HawkesSimulator:
+    def __init__(self, mu, alpha, beta, dim_process, start_time=0.0, end_time=1.0, seed=None):
+        self.dim_process = dim_process
+        self.start_time = start_time
+        self.end_time = end_time
+        if seed is not None:
+            np.random.seed(seed)
+        self.mu = np.array(mu).reshape(dim_process)
+        self.alpha = np.array(alpha).reshape(dim_process, dim_process)
+        self.beta = np.array(beta).reshape(dim_process, dim_process)
+
+    def simulate(self):
+        dim = self.dim_process
+        times = []
+        marks = []
+        t = 0.0
+        lambda_trg = np.ones((dim, dim))
+
+        while t < self.end_time:
+            lambda_total = np.array([self.mu[i] + np.sum(lambda_trg[i]) for i in range(dim)])
+            lambda_sum = np.sum(lambda_total)
+
+            dt = np.random.exponential(scale=1.0 / lambda_sum) if lambda_sum > 0 else float("inf")
+            t += dt
+
+            if t >= self.end_time:
+                break
+
+            lambda_trg *= np.exp(-self.beta * dt)
+            lambda_next = np.array([self.mu[i] + np.sum(lambda_trg[i]) for i in range(dim)])
+            lambda_next_sum = np.sum(lambda_next)
+
+            if np.random.rand() < lambda_next_sum / lambda_sum:
+                event_dim = np.random.choice(dim, p=lambda_total / lambda_sum)
+                times.append(t)
+                marks.append(event_dim)
+                lambda_trg[:, event_dim] += self.alpha[:, event_dim]
+
+        times = np.array(times)
+        valid = times > self.start_time
+        return times[valid] - self.start_time, np.array(marks)[valid]
+
+
+def sim_hawkes_exp(mu, alpha, beta, num_sim, num_time_steps, T, burn_in=100.0, desc=""):
+    time_grid = np.linspace(0, T, num_time_steps)
+    paths = np.zeros((num_time_steps, num_sim))
+
+    for s in tqdm(range(num_sim), desc=desc, leave=False):
+        simulator = HawkesSimulator(
+            mu=[mu], alpha=[[alpha]], beta=[[beta]], dim_process=1,
+            start_time=burn_in, end_time=T + burn_in
+        )
+        event_times, _ = simulator.simulate()
+        if len(event_times) > 0:
+            paths[:, s] = np.searchsorted(event_times, time_grid, side="right")
+
+    return np.concatenate((
+        paths[:, :, None],
+        np.repeat(time_grid[:, None, None], repeats=num_sim, axis=1)
+    ), axis=2)
+
+
 def simulate_hawkes_thinning(mu, kernel_func, end_time, start_time=0.0):
     """Simulate 1D Hawkes with any non-increasing kernel via Ogata thinning."""
     events = []
@@ -137,9 +199,8 @@ def sim_hawkes_general(mu, kernel_func, num_sim, num_time_steps, T, burn_in, des
 
 def load_paths(config: KernelComparisonConfig, num_sim: int, p_value: float):
     """Generate H0 (exponential) and H1 (power-law) paths."""
-    exp_kern = exponential_kernel(config.alpha_exp, config.beta)
-    h0_bank = sim_hawkes_general(
-        config.mu, exp_kern, num_sim, config.grid_points, config.T, config.burn_in,
+    h0_bank = sim_hawkes_exp(
+        config.mu, config.alpha_exp, config.beta, num_sim, config.grid_points, config.T, config.burn_in,
         desc=f"H0 exp(α={config.alpha_exp:.1f})"
     )
 
