@@ -1,8 +1,8 @@
 #!/bin/bash
 #
 #SBATCH --job-name=hawkes_analysis
-#SBATCH --output=/raid/home/students/regna_enz/SignatureMMDTesting/out.out
-#SBATCH --error=/raid/home/students/regna_enz/SignatureMMDTesting/out.out
+#SBATCH --output=/raid/home/students/regna_enz/SignatureMMDTesting/out1.out
+#SBATCH --error=/raid/home/students/regna_enz/SignatureMMDTesting/out1.out
 
 ## Mails
 #SBATCH --mail-type=ALL
@@ -26,4 +26,4 @@ cd /raid/home/students/regna_enz/SignatureMMDTesting
 
 ## Lancer le script
 export PYTHONUNBUFFERED=1
-uv run poisson_comparison.py
+uv run hawkes_kernel_comparison.py

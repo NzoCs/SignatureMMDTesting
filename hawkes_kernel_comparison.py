@@ -49,7 +49,7 @@ class KernelComparisonConfig:
 
     # Sweep over power-law exponent p
     p_values: List[float] = field(default_factory=lambda: [1.5, 2.0, 3.0, 5.0, 8.0])
-    scalings: List[float] = field(default_factory=lambda: [1.0])
+    scalings: List[float] = field(default_factory=lambda: [0.25, 0.5, 1.0, 2.0])
 
     # Execution
     n_atoms_delta: int = 1000

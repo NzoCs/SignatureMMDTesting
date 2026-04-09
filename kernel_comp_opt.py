@@ -55,11 +55,11 @@ class KernelComparisonConfig:
 
     # Sweep over exponential alpha1 (H1)
     alphas_h1: List[float] = field(default_factory=lambda: np.linspace(2, 8, 7).tolist())
-    scalings: List[float] = field(default_factory=lambda: [1.0])
+    scalings: List[float] = field(default_factory=lambda: [0.1, 0.5, 1.0, 2.0])
 
     # Execution
     n_atoms_delta: int = 1000
-    n_paths: int = 128
+    n_paths: int = 256
     n_bank: int = 1024
     num_rep: int = 10
     alpha_test: float = 0.05
