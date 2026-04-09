@@ -19,7 +19,12 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from src.mmd.mmd import SigKernel, LinearKernel, RBFKernel
+from experiment_utils import (
+    precompute_gram_chunked, compute_errors_from_gram,
+    process_paths_pair_to_tensor,
+    init_results_dicts, accumulate_results, compute_pooled_stats,
+    make_sig_kernel,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -38,7 +43,7 @@ class PoissonComparisonConfig:
 
     # Sweep over ratio λ1/λ0
     ratios: List[float] = field(default_factory=lambda: [0.5, 0.7, 0.8, 0.9, 0.95, 1.0, 1.05, 1.1, 1.2, 1.3, 1.5, 2.0])
-    scalings: List[float] = field(default_factory=lambda: [0.1, 0.25, 0.5, 1.0])
+    scalings: List[float] = field(default_factory=lambda: [1.0])
 
     # Execution
     n_atoms_delta: int = 500
@@ -54,12 +59,8 @@ class PoissonComparisonConfig:
     def lambda1(self, ratio: float) -> float:
         return self.lambda0 * ratio
 
-    def make_kernel(self, scaling: float = 1.0) -> SigKernel:
-        if self.kernel_type == "rbf":
-            static = RBFKernel(sigma=self.rbf_sigma, scaling=scaling)
-        else:
-            static = LinearKernel(scaling=scaling)
-        return SigKernel(static_kernel=static, dyadic_order=0)
+    def make_kernel(self, scaling: float = 1.0):
+        return make_sig_kernel(self.kernel_type, self.rbf_sigma, scaling)
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +72,6 @@ def sim_poisson(lam, num_sim, num_time_steps, T):
     paths = np.zeros((num_time_steps, num_sim))
 
     for s in range(num_sim):
-        # Generate events via exponential inter-arrivals
         events = []
         t = 0.0
         while True:
@@ -88,107 +88,19 @@ def sim_poisson(lam, num_sim, num_time_steps, T):
     ), axis=2)
 
 
-def load_poisson_paths(config: PoissonComparisonConfig, num_sim: int, ratio: float):
+def load_poisson_paths(config, num_sim, ratio):
     """Generate H0 and H1 Poisson paths."""
     h0_bank = sim_poisson(config.lambda0, num_sim, config.grid_points, config.T)
+    h1_bank = sim_poisson(config.lambda1(ratio), num_sim, config.grid_points, config.T)
+    return process_paths_pair_to_tensor(h0_bank, h1_bank, config, num_sim)
 
-    lam1 = config.lambda1(ratio)
-    h1_bank = sim_poisson(lam1, num_sim, config.grid_points, config.T)
-
-    h0 = torch.transpose(torch.from_numpy(h0_bank), 0, 1).to(device=config.device, dtype=torch.float32)
-    h1 = torch.transpose(torch.from_numpy(h1_bank), 0, 1).to(device=config.device, dtype=torch.float32)
-
-    for i in range(num_sim):
-        h0[i] -= h0[i, 0, :]
-        h1[i] -= h1[i, 0, :]
-
-    count_std = h0[:, -1, 0].std().item()
-    if count_std > 1e-8:
-        h0[:, :, 0] /= count_std
-        h1[:, :, 0] /= count_std
-    if config.T > 0:
-        h0[:, :, 1] /= config.T
-        h1[:, :, 1] /= config.T
-
-    return h0, h1
-
-
-# ---------------------------------------------------------------------------
-# Gram precomputation
-# ---------------------------------------------------------------------------
-def precompute_gram_chunked(sig_kernel, X, Y, sym=False, chunk_size=128):
-    nx, ny = X.shape[0], Y.shape[0]
-    K = torch.zeros(nx, ny, dtype=X.dtype, device=X.device)
-    for i in range(0, nx, chunk_size):
-        j_start = i if sym else 0
-        for j in range(j_start, ny, chunk_size):
-            bx = X[i:i+chunk_size]
-            by = Y[j:j+chunk_size]
-            with torch.no_grad():
-                block = sig_kernel.compute_Gram(bx, by, sym=(sym and i == j))
-            K[i:i+chunk_size, j:j+chunk_size] = block
-            if sym and i != j:
-                K[j:j+chunk_size, i:i+chunk_size] = block.t()
-    return K
-
-
-def mmd_ub_from_subgram(K_XX, K_YY, K_XY):
-    nx, ny = K_XX.shape[0], K_YY.shape[0]
-    xx = (K_XX.sum() - K_XX.diagonal().sum()) / (nx * (nx - 1))
-    yy = (K_YY.sum() - K_YY.diagonal().sum()) / (ny * (ny - 1))
-    xy = K_XY.mean()
-    return (xx + yy - 2.0 * xy).item()
-
-
-def compute_errors_from_gram(K_h0, K_h1, K_h0h1, n_atoms, batch_size, alpha_test):
-    n0, n1 = K_h0.shape[0], K_h1.shape[0]
-    K_h0, K_h1, K_h0h1 = K_h0.cpu(), K_h1.cpu(), K_h0h1.cpu()
-
-    h0_dists  = np.empty(n_atoms)
-    h1_dists  = np.empty(n_atoms)
-    h00_dists = np.empty(n_atoms)
-    h01_dists = np.empty(n_atoms)
-
-    for i in range(n_atoms):
-        ix1 = torch.randperm(n0)[:batch_size]
-        ix2 = torch.randperm(n0)[:batch_size]
-        iy  = torch.randperm(n1)[:batch_size]
-
-        h0_dists[i] = mmd_ub_from_subgram(
-            K_h0[ix1][:, ix1], K_h0[ix2][:, ix2], K_h0[ix1][:, ix2])
-        h1_dists[i] = mmd_ub_from_subgram(
-            K_h0[ix1][:, ix1], K_h1[iy][:, iy], K_h0h1[ix1][:, iy])
-
-        ix3 = torch.randperm(n0)[:batch_size]
-        ix4 = torch.randperm(n0)[:batch_size]
-        ix5 = torch.randperm(n0)[:batch_size]
-
-        h00_dists[i] = mmd_ub_from_subgram(
-            K_h0[ix3][:, ix3], K_h0[ix4][:, ix4], K_h0[ix3][:, ix4])
-        h01_dists[i] = mmd_ub_from_subgram(
-            K_h0[ix3][:, ix3], K_h0[ix5][:, ix5], K_h0[ix3][:, ix5])
-
-    crit  = np.sort(h0_dists)[int(n_atoms * (1 - alpha_test))]
-    t2e   = 100.0 * np.mean(h1_dists <= crit)
-    crit2 = np.sort(h00_dists)[int(n_atoms * (1 - alpha_test))]
-    t1e   = 100.0 * np.mean(h01_dists <= crit2)
-
-    h0_sorted = np.sort(h0_dists)
-    p_val_arr = (n_atoms - np.searchsorted(h0_sorted, h1_dists, side='left')) / n_atoms
-    mean_pval = np.mean(p_val_arr)
-
-    raw = (h0_dists, h1_dists, h00_dists, h01_dists)
-    return 100.0 - t1e, t2e, mean_pval, raw
 
 # ---------------------------------------------------------------------------
 # Sweep & Plotting
 # ---------------------------------------------------------------------------
-def execute_sweep(config: PoissonComparisonConfig):
-    results_t1e = {s: {r: [] for r in config.ratios} for s in config.scalings}
-    results_t2e = {s: {r: [] for r in config.ratios} for s in config.scalings}
-    results_pval = {s: {r: [] for r in config.ratios} for s in config.scalings}
-    pooled_raw  = {s: {r: {'h0': [], 'h1': [], 'h00': [], 'h01': []}
-                       for r in config.ratios} for s in config.scalings}
+def execute_sweep(config):
+    results_t1e, results_t2e, results_pval, results_norm_mmd, pooled_raw = \
+        init_results_dicts(config.scalings, config.ratios)
 
     for rep in tqdm(range(config.num_rep), desc="Repetitions"):
         for ratio in tqdm(config.ratios, desc=f"  Rep {rep+1} — ratios", leave=False):
@@ -205,39 +117,16 @@ def execute_sweep(config: PoissonComparisonConfig):
                     K_h0, K_h1, K_h0h1,
                     config.n_atoms_delta, config.n_paths, config.alpha_test)
 
-                results_t1e[scal][ratio].append(t1e)
-                results_t2e[scal][ratio].append(t2e)
-                results_pval[scal][ratio].append(mean_pval)
-
-                h0_d, h1_d, h00_d, h01_d = raw
-                pooled_raw[scal][ratio]['h0'].append(h0_d)
-                pooled_raw[scal][ratio]['h1'].append(h1_d)
-                pooled_raw[scal][ratio]['h00'].append(h00_d)
-                pooled_raw[scal][ratio]['h01'].append(h01_d)
+                accumulate_results(results_t1e, results_t2e, results_pval,
+                                   results_norm_mmd, pooled_raw,
+                                   scal, ratio, t1e, t2e, mean_pval, raw)
 
         logging.info(f"Rep {rep+1}/{config.num_rep} done.")
 
-    # Pooled errors
-    pooled_t1e = {s: {} for s in config.scalings}
-    pooled_t2e = {s: {} for s in config.scalings}
-    pooled_pval = {s: {} for s in config.scalings}
-    for scal in config.scalings:
-        for ratio in config.ratios:
-            a0  = np.concatenate(pooled_raw[scal][ratio]['h0'])
-            a1  = np.concatenate(pooled_raw[scal][ratio]['h1'])
-            a00 = np.concatenate(pooled_raw[scal][ratio]['h00'])
-            a01 = np.concatenate(pooled_raw[scal][ratio]['h01'])
-            n = len(a0)
-            sorted_a0 = np.sort(a0)
-            c1 = sorted_a0[int(n * (1 - config.alpha_test))]
-            c2 = np.sort(a00)[int(n * (1 - config.alpha_test))]
-            pooled_t2e[scal][ratio] = 100.0 * np.mean(a1 <= c1)
-            pooled_t1e[scal][ratio] = 100.0 - 100.0 * np.mean(a01 <= c2)
-            
-            p_vals_pooled = (n - np.searchsorted(sorted_a0, a1, side='left')) / n
-            pooled_pval[scal][ratio] = np.mean(p_vals_pooled)
+    pooled_t1e, pooled_t2e, pooled_pval, pooled_norm_mmd = \
+        compute_pooled_stats(pooled_raw, config.scalings, config.ratios, config.alpha_test)
 
-    return results_t1e, results_t2e, results_pval, pooled_t1e, pooled_t2e, pooled_pval
+    return results_t1e, results_t2e, results_pval, results_norm_mmd, pooled_t1e, pooled_t2e, pooled_pval, pooled_norm_mmd
 
 
 def plot_per_rep(results_t1e, results_t2e, config, save_dir):
@@ -314,44 +203,73 @@ def plot_pooled(pooled_t1e, pooled_t2e, config, save_dir):
 def plot_pvalues(results_pval, pooled_pval, config, save_dir):
     rs = np.array(config.ratios)
     colors = plt.cm.viridis(np.linspace(0, 0.9, len(config.scalings)))
-    
-    # 1. Per rep figure
+
     fig, ax = plt.subplots(figsize=(7, 5))
     for scal, color in zip(config.scalings, colors):
         means_p = np.array([np.mean(results_pval[scal][r]) for r in rs])
         stds_p  = np.array([np.std(results_pval[scal][r]) for r in rs])
         ax.plot(rs, means_p, label=f"Scale: {scal}", color=color, marker='o')
         ax.fill_between(rs, means_p - stds_p, means_p + stds_p, color=color, alpha=0.2)
-        
     ax.axvline(x=1.0, color='grey', linestyle=':', alpha=0.5, label=r'$\lambda_1/\lambda_0=1$')
     ax.set_xlabel(r"$\lambda_1 / \lambda_0$", fontsize=12)
     ax.set_ylabel("Empirical P-value", fontsize=12)
     ax.set_title(f"Per-Rep Mean P-value ({config.num_rep} reps)", fontsize=13)
     ax.legend(title="Scaling", fontsize=10)
     ax.grid(True, linestyle='--', alpha=0.6)
-    
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, "poisson_comparison_pvalues_per_rep.svg"), format="svg")
     plt.close()
 
-    # 2. Pooled figure
     fig, ax = plt.subplots(figsize=(7, 5))
     for scal, color in zip(config.scalings, colors):
         pt_p = np.array([pooled_pval[scal][r] for r in rs])
         ax.plot(rs, pt_p, label=f"Scale: {scal}", color=color, marker='s')
-        
     ax.axvline(x=1.0, color='grey', linestyle=':', alpha=0.5, label=r'$\lambda_1/\lambda_0=1$')
     ax.set_xlabel(r"$\lambda_1 / \lambda_0$", fontsize=12)
     ax.set_ylabel("Pooled Empirical P-value", fontsize=12)
     ax.set_title(f"Pooled P-value vs Ratio", fontsize=13)
     ax.legend(title="Scaling", fontsize=10)
     ax.grid(True, linestyle='--', alpha=0.6)
-    
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, "poisson_comparison_pvalues_pooled.svg"), format="svg")
     plt.close()
-    
     logging.info(f"Saved separated p-values plots to {save_dir}/")
+
+
+def plot_norm_mmd(results_norm_mmd, pooled_norm_mmd, config, save_dir):
+    rs = np.array(config.ratios)
+    colors = plt.cm.viridis(np.linspace(0, 0.9, len(config.scalings)))
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for scal, color in zip(config.scalings, colors):
+        means_n = np.array([np.mean(results_norm_mmd[scal][r]) for r in rs])
+        stds_n  = np.array([np.std(results_norm_mmd[scal][r]) for r in rs])
+        ax.plot(rs, means_n, label=f"Scale: {scal}", color=color, marker='o')
+        ax.fill_between(rs, means_n - stds_n, means_n + stds_n, color=color, alpha=0.2)
+    ax.axvline(x=1.0, color='grey', linestyle=':', alpha=0.5, label=r'$\lambda_1/\lambda_0=1$')
+    ax.set_xlabel(r"$\lambda_1 / \lambda_0$", fontsize=12)
+    ax.set_ylabel(r"Normalized MMD ($\hat{MMD}^2 / \sigma_{H0}$)", fontsize=12)
+    ax.set_title(f"Per-Rep Mean Normalized MMD ({config.num_rep} reps)", fontsize=13)
+    ax.legend(title="Scaling", fontsize=10)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "poisson_comparison_norm_mmd_per_rep.svg"), format="svg")
+    plt.close()
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for scal, color in zip(config.scalings, colors):
+        pt_n = np.array([pooled_norm_mmd[scal][r] for r in rs])
+        ax.plot(rs, pt_n, label=f"Scale: {scal}", color=color, marker='s')
+    ax.axvline(x=1.0, color='grey', linestyle=':', alpha=0.5, label=r'$\lambda_1/\lambda_0=1$')
+    ax.set_xlabel(r"$\lambda_1 / \lambda_0$", fontsize=12)
+    ax.set_ylabel(r"Pooled Normalized MMD ($\hat{MMD}^2 / \sigma_{H0}$)", fontsize=12)
+    ax.set_title(f"Pooled Normalized MMD vs Ratio", fontsize=13)
+    ax.legend(title="Scaling", fontsize=10)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "poisson_comparison_norm_mmd_pooled.svg"), format="svg")
+    plt.close()
+    logging.info(f"Saved normalized MMD plots to {save_dir}/")
 
 
 # ---------------------------------------------------------------------------
@@ -367,11 +285,12 @@ def main():
     kernel_dir = os.path.join(config.data_dir, config.kernel_type)
     os.makedirs(kernel_dir, exist_ok=True)
 
-    results_t1e, results_t2e, results_pval, pooled_t1e, pooled_t2e, pooled_pval = execute_sweep(config)
+    results_t1e, results_t2e, results_pval, results_norm_mmd, pooled_t1e, pooled_t2e, pooled_pval, pooled_norm_mmd = execute_sweep(config)
 
     plot_per_rep(results_t1e, results_t2e, config, kernel_dir)
     plot_pooled(pooled_t1e, pooled_t2e, config, kernel_dir)
     plot_pvalues(results_pval, pooled_pval, config, kernel_dir)
+    plot_norm_mmd(results_norm_mmd, pooled_norm_mmd, config, kernel_dir)
 
     with open(os.path.join(kernel_dir, "metadata.json"), "w") as f:
         json.dump(config.__dict__, f, indent=4)

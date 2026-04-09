@@ -21,7 +21,13 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from src.mmd.mmd import SigKernel, LinearKernel, RBFKernel
+from experiment_utils import (
+    powerlaw_kernel, sim_hawkes_exp, sim_hawkes_general,
+    process_paths_pair_to_tensor,
+    precompute_gram_chunked, compute_errors_from_gram,
+    init_results_dicts, accumulate_results, compute_pooled_stats,
+    make_sig_kernel,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -53,8 +59,8 @@ class KernelComparisonConfig:
     alpha_test: float = 0.05
 
     # Kernel choice
-    kernel_type: str = "rbf"   # "linear" or "rbf"
-    rbf_sigma: float = 1.0        # sigma for RBF kernel
+    kernel_type: str = "rbf"
+    rbf_sigma: float = 1.0
 
     @property
     def mu(self) -> float:
@@ -67,137 +73,14 @@ class KernelComparisonConfig:
     def alpha_poly(self, p: float) -> float:
         return self.branching_ratio * self.beta * (p - 1)
 
-    def make_kernel(self, scaling: float = 1.0) -> SigKernel:
-        if self.kernel_type == "rbf":
-            static = RBFKernel(sigma=self.rbf_sigma, scaling=scaling)
-        else:
-            static = LinearKernel(scaling=scaling)
-        return SigKernel(static_kernel=static, dyadic_order=0)
+    def make_kernel(self, scaling: float = 1.0):
+        return make_sig_kernel(self.kernel_type, self.rbf_sigma, scaling)
 
 
 # ---------------------------------------------------------------------------
-# Kernel functions
+# Path loading
 # ---------------------------------------------------------------------------
-def exponential_kernel(alpha, beta):
-    def kernel(dt):
-        return alpha * np.exp(-beta * dt)
-    return kernel
-
-
-def powerlaw_kernel(alpha, beta, p):
-    def kernel(dt):
-        return alpha * (1.0 + beta * dt) ** (-p)
-    return kernel
-
-
-# ---------------------------------------------------------------------------
-# Hawkes simulators
-# ---------------------------------------------------------------------------
-class HawkesSimulator:
-    def __init__(self, mu, alpha, beta, dim_process, start_time=0.0, end_time=1.0, seed=None):
-        self.dim_process = dim_process
-        self.start_time = start_time
-        self.end_time = end_time
-        if seed is not None:
-            np.random.seed(seed)
-        self.mu = np.array(mu).reshape(dim_process)
-        self.alpha = np.array(alpha).reshape(dim_process, dim_process)
-        self.beta = np.array(beta).reshape(dim_process, dim_process)
-
-    def simulate(self):
-        dim = self.dim_process
-        times = []
-        marks = []
-        t = 0.0
-        lambda_trg = np.ones((dim, dim))
-
-        while t < self.end_time:
-            lambda_total = np.array([self.mu[i] + np.sum(lambda_trg[i]) for i in range(dim)])
-            lambda_sum = np.sum(lambda_total)
-
-            dt = np.random.exponential(scale=1.0 / lambda_sum) if lambda_sum > 0 else float("inf")
-            t += dt
-
-            if t >= self.end_time:
-                break
-
-            lambda_trg *= np.exp(-self.beta * dt)
-            lambda_next = np.array([self.mu[i] + np.sum(lambda_trg[i]) for i in range(dim)])
-            lambda_next_sum = np.sum(lambda_next)
-
-            if np.random.rand() < lambda_next_sum / lambda_sum:
-                event_dim = np.random.choice(dim, p=lambda_total / lambda_sum)
-                times.append(t)
-                marks.append(event_dim)
-                lambda_trg[:, event_dim] += self.alpha[:, event_dim]
-
-        times = np.array(times)
-        valid = times > self.start_time
-        return times[valid] - self.start_time, np.array(marks)[valid]
-
-
-def sim_hawkes_exp(mu, alpha, beta, num_sim, num_time_steps, T, burn_in=100.0, desc=""):
-    time_grid = np.linspace(0, T, num_time_steps)
-    paths = np.zeros((num_time_steps, num_sim))
-
-    for s in tqdm(range(num_sim), desc=desc, leave=False):
-        simulator = HawkesSimulator(
-            mu=[mu], alpha=[[alpha]], beta=[[beta]], dim_process=1,
-            start_time=burn_in, end_time=T + burn_in
-        )
-        event_times, _ = simulator.simulate()
-        if len(event_times) > 0:
-            paths[:, s] = np.searchsorted(event_times, time_grid, side="right")
-
-    return np.concatenate((
-        paths[:, :, None],
-        np.repeat(time_grid[:, None, None], repeats=num_sim, axis=1)
-    ), axis=2)
-
-
-def simulate_hawkes_thinning(mu, kernel_func, end_time, start_time=0.0):
-    """Simulate 1D Hawkes with any non-increasing kernel via Ogata thinning."""
-    events = []
-    t = 0.0
-
-    while t < end_time:
-        lam = mu + sum(kernel_func(t - s) for s in events)
-        if lam < 1e-10:
-            t += 0.01
-            continue
-
-        dt = np.random.exponential(1.0 / lam)
-        t += dt
-        if t >= end_time:
-            break
-
-        lam_new = mu + sum(kernel_func(t - s) for s in events)
-        if np.random.rand() * lam <= lam_new:
-            events.append(t)
-
-    events = np.array(events) if events else np.array([])
-    if len(events) > 0:
-        valid = events > start_time
-        return events[valid] - start_time
-    return np.array([])
-
-
-def sim_hawkes_general(mu, kernel_func, num_sim, num_time_steps, T, burn_in, desc=""):
-    time_grid = np.linspace(0, T, num_time_steps)
-    paths = np.zeros((num_time_steps, num_sim))
-
-    for s in tqdm(range(num_sim), desc=desc, leave=False):
-        event_times = simulate_hawkes_thinning(mu, kernel_func, T + burn_in, start_time=burn_in)
-        if len(event_times) > 0:
-            paths[:, s] = np.searchsorted(event_times, time_grid, side="right")
-
-    return np.concatenate((
-        paths[:, :, None],
-        np.repeat(time_grid[:, None, None], repeats=num_sim, axis=1)
-    ), axis=2)
-
-
-def load_paths(config: KernelComparisonConfig, num_sim: int, p_value: float):
+def load_paths(config, num_sim, p_value):
     """Generate H0 (exponential) and H1 (power-law) paths."""
     h0_bank = sim_hawkes_exp(
         config.mu, config.alpha_exp, config.beta, num_sim, config.grid_points, config.T, config.burn_in,
@@ -211,102 +94,15 @@ def load_paths(config: KernelComparisonConfig, num_sim: int, p_value: float):
         desc=f"H1 poly(p={p_value:.1f})"
     )
 
-    h0 = torch.transpose(torch.from_numpy(h0_bank), 0, 1).to(device=config.device, dtype=torch.float32)
-    h1 = torch.transpose(torch.from_numpy(h1_bank), 0, 1).to(device=config.device, dtype=torch.float32)
-
-    for i in range(num_sim):
-        h0[i] -= h0[i, 0, :]
-        h1[i] -= h1[i, 0, :]
-
-    count_std = h0[:, -1, 0].std().item()
-    if count_std > 1e-8:
-        h0[:, :, 0] /= count_std
-        h1[:, :, 0] /= count_std
-    if config.T > 0:
-        h0[:, :, 1] /= config.T
-        h1[:, :, 1] /= config.T
-
-    return h0, h1
-
-
-# ---------------------------------------------------------------------------
-# Gram precomputation (same as hawkes_improved_analysis.py)
-# ---------------------------------------------------------------------------
-def precompute_gram_chunked(sig_kernel, X, Y, sym=False, chunk_size=64):
-    nx, ny = X.shape[0], Y.shape[0]
-    K = torch.zeros(nx, ny, dtype=X.dtype, device=X.device)
-    for i in range(0, nx, chunk_size):
-        j_start = i if sym else 0
-        for j in range(j_start, ny, chunk_size):
-            bx = X[i:i+chunk_size]
-            by = Y[j:j+chunk_size]
-            with torch.no_grad():
-                block = sig_kernel.compute_Gram(bx, by, sym=(sym and i == j))
-            K[i:i+chunk_size, j:j+chunk_size] = block
-            if sym and i != j:
-                K[j:j+chunk_size, i:i+chunk_size] = block.t()
-    return K
-
-
-def mmd_ub_from_subgram(K_XX, K_YY, K_XY):
-    nx, ny = K_XX.shape[0], K_YY.shape[0]
-    xx = (K_XX.sum() - K_XX.diagonal().sum()) / (nx * (nx - 1))
-    yy = (K_YY.sum() - K_YY.diagonal().sum()) / (ny * (ny - 1))
-    xy = K_XY.mean()
-    return (xx + yy - 2.0 * xy).item()
-
-
-def compute_errors_from_gram(K_h0, K_h1, K_h0h1, n_atoms, batch_size, alpha_test):
-    n0, n1 = K_h0.shape[0], K_h1.shape[0]
-    K_h0, K_h1, K_h0h1 = K_h0.cpu(), K_h1.cpu(), K_h0h1.cpu()
-
-    h0_dists  = np.empty(n_atoms)
-    h1_dists  = np.empty(n_atoms)
-    h00_dists = np.empty(n_atoms)
-    h01_dists = np.empty(n_atoms)
-
-    for i in range(n_atoms):
-        ix1 = torch.randperm(n0)[:batch_size]
-        ix2 = torch.randperm(n0)[:batch_size]
-        iy  = torch.randperm(n1)[:batch_size]
-
-        h0_dists[i] = mmd_ub_from_subgram(
-            K_h0[ix1][:, ix1], K_h0[ix2][:, ix2], K_h0[ix1][:, ix2])
-        h1_dists[i] = mmd_ub_from_subgram(
-            K_h0[ix1][:, ix1], K_h1[iy][:, iy], K_h0h1[ix1][:, iy])
-
-        ix3 = torch.randperm(n0)[:batch_size]
-        ix4 = torch.randperm(n0)[:batch_size]
-        ix5 = torch.randperm(n0)[:batch_size]
-
-        h00_dists[i] = mmd_ub_from_subgram(
-            K_h0[ix3][:, ix3], K_h0[ix4][:, ix4], K_h0[ix3][:, ix4])
-        h01_dists[i] = mmd_ub_from_subgram(
-            K_h0[ix3][:, ix3], K_h0[ix5][:, ix5], K_h0[ix3][:, ix5])
-
-    crit  = np.sort(h0_dists)[int(n_atoms * (1 - alpha_test))]
-    t2e   = 100.0 * np.mean(h1_dists <= crit)
-    crit2 = np.sort(h00_dists)[int(n_atoms * (1 - alpha_test))]
-    t1e   = 100.0 * np.mean(h01_dists <= crit2)
-
-    # P-value for H0 vs H1
-    h0_sorted = np.sort(h0_dists)
-    p_val_arr = (n_atoms - np.searchsorted(h0_sorted, h1_dists, side='left')) / n_atoms
-    mean_pval = np.mean(p_val_arr)
-
-    raw = (h0_dists, h1_dists, h00_dists, h01_dists)
-    return 100.0 - t1e, t2e, mean_pval, raw
+    return process_paths_pair_to_tensor(h0_bank, h1_bank, config, num_sim)
 
 
 # ---------------------------------------------------------------------------
 # Sweep & Plotting
 # ---------------------------------------------------------------------------
-def execute_sweep(config: KernelComparisonConfig):
-    results_t1e = {s: {p: [] for p in config.p_values} for s in config.scalings}
-    results_t2e = {s: {p: [] for p in config.p_values} for s in config.scalings}
-    results_pval = {s: {p: [] for p in config.p_values} for s in config.scalings}
-    pooled_raw  = {s: {p: {'h0': [], 'h1': [], 'h00': [], 'h01': []}
-                       for p in config.p_values} for s in config.scalings}
+def execute_sweep(config):
+    results_t1e, results_t2e, results_pval, results_norm_mmd, pooled_raw = \
+        init_results_dicts(config.scalings, config.p_values)
 
     for rep in tqdm(range(config.num_rep), desc="Repetitions"):
         for p_val in tqdm(config.p_values, desc=f"  Rep {rep+1} — p values", leave=False):
@@ -323,39 +119,16 @@ def execute_sweep(config: KernelComparisonConfig):
                     K_h0, K_h1, K_h0h1,
                     config.n_atoms_delta, config.n_paths, config.alpha_test)
 
-                results_t1e[scal][p_val].append(t1e)
-                results_t2e[scal][p_val].append(t2e)
-                results_pval[scal][p_val].append(mean_pval)
-
-                h0_d, h1_d, h00_d, h01_d = raw
-                pooled_raw[scal][p_val]['h0'].append(h0_d)
-                pooled_raw[scal][p_val]['h1'].append(h1_d)
-                pooled_raw[scal][p_val]['h00'].append(h00_d)
-                pooled_raw[scal][p_val]['h01'].append(h01_d)
+                accumulate_results(results_t1e, results_t2e, results_pval,
+                                   results_norm_mmd, pooled_raw,
+                                   scal, p_val, t1e, t2e, mean_pval, raw)
 
         logging.info(f"Rep {rep+1}/{config.num_rep} done.")
 
-    # Pooled errors
-    pooled_t1e = {s: {} for s in config.scalings}
-    pooled_t2e = {s: {} for s in config.scalings}
-    pooled_pval = {s: {} for s in config.scalings}
-    for scal in config.scalings:
-        for p_val in config.p_values:
-            a0  = np.concatenate(pooled_raw[scal][p_val]['h0'])
-            a1  = np.concatenate(pooled_raw[scal][p_val]['h1'])
-            a00 = np.concatenate(pooled_raw[scal][p_val]['h00'])
-            a01 = np.concatenate(pooled_raw[scal][p_val]['h01'])
-            n = len(a0)
-            sorted_a0 = np.sort(a0)
-            c1 = sorted_a0[int(n * (1 - config.alpha_test))]
-            c2 = np.sort(a00)[int(n * (1 - config.alpha_test))]
-            pooled_t2e[scal][p_val] = 100.0 * np.mean(a1 <= c1)
-            pooled_t1e[scal][p_val] = 100.0 - 100.0 * np.mean(a01 <= c2)
+    pooled_t1e, pooled_t2e, pooled_pval, pooled_norm_mmd = \
+        compute_pooled_stats(pooled_raw, config.scalings, config.p_values, config.alpha_test)
 
-            p_vals_pooled = (n - np.searchsorted(sorted_a0, a1, side='left')) / n
-            pooled_pval[scal][p_val] = np.mean(p_vals_pooled)
-
-    return results_t1e, results_t2e, results_pval, pooled_t1e, pooled_t2e, pooled_pval
+    return results_t1e, results_t2e, results_pval, results_norm_mmd, pooled_t1e, pooled_t2e, pooled_pval, pooled_norm_mmd
 
 
 def plot_per_rep(results_t1e, results_t2e, config, save_dir):
@@ -368,7 +141,6 @@ def plot_per_rep(results_t1e, results_t2e, config, save_dir):
         s1 = np.array([np.std(results_t1e[scal][p]) for p in ps])
         axes[0].plot(ps, m1, label=f"Scale: {scal}", color=color, marker='o')
         axes[0].fill_between(ps, m1 - s1, m1 + s1, color=color, alpha=0.2)
-
         m2 = np.array([np.mean(results_t2e[scal][p]) for p in ps])
         s2 = np.array([np.std(results_t2e[scal][p]) for p in ps])
         axes[1].plot(ps, m2, label=f"Scale: {scal}", color=color, marker='o')
@@ -380,13 +152,11 @@ def plot_per_rep(results_t1e, results_t2e, config, save_dir):
     axes[0].set_title(f"Type 1 Error — Exp vs Power-law ({config.num_rep} reps)", fontsize=13)
     axes[0].legend(title="Scaling", fontsize=10)
     axes[0].grid(True, linestyle='--', alpha=0.6)
-
     axes[1].set_xlabel("Power-law exponent p", fontsize=12)
     axes[1].set_ylabel("P[Type 2 Error] (%)", fontsize=12)
     axes[1].set_title(f"Type 2 Error — Exp vs Power-law ({config.num_rep} reps)", fontsize=13)
     axes[1].legend(title="Scaling", fontsize=10)
     axes[1].grid(True, linestyle='--', alpha=0.6)
-
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, "kernel_comparison_per_rep.svg"), format="svg")
     plt.close()
@@ -396,42 +166,69 @@ def plot_per_rep(results_t1e, results_t2e, config, save_dir):
 def plot_pvalues(results_pval, pooled_pval, config, save_dir):
     ps = np.array(config.p_values)
     colors = plt.cm.viridis(np.linspace(0, 0.9, len(config.scalings)))
-    
-    # 1. Per rep figure
+
     fig, ax = plt.subplots(figsize=(7, 5))
     for scal, color in zip(config.scalings, colors):
         means_p = np.array([np.mean(results_pval[scal][p]) for p in ps])
         stds_p  = np.array([np.std(results_pval[scal][p]) for p in ps])
         ax.plot(ps, means_p, label=f"Scale: {scal}", color=color, marker='o')
         ax.fill_between(ps, means_p - stds_p, means_p + stds_p, color=color, alpha=0.2)
-        
     ax.set_xlabel("Power-law exponent p", fontsize=12)
     ax.set_ylabel("Empirical P-value", fontsize=12)
     ax.set_title(f"Per-Rep Mean P-value ({config.num_rep} reps)", fontsize=13)
     ax.legend(title="Scaling", fontsize=10)
     ax.grid(True, linestyle='--', alpha=0.6)
-    
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, "hawkes_kernel_pvalues_per_rep.svg"), format="svg")
     plt.close()
 
-    # 2. Pooled figure
     fig, ax = plt.subplots(figsize=(7, 5))
     for scal, color in zip(config.scalings, colors):
         pt_p = np.array([pooled_pval[scal][p] for p in ps])
         ax.plot(ps, pt_p, label=f"Scale: {scal}", color=color, marker='s')
-        
     ax.set_xlabel("Power-law exponent p", fontsize=12)
     ax.set_ylabel("Pooled Empirical P-value", fontsize=12)
     ax.set_title(f"Pooled P-value vs Power-law exp", fontsize=13)
     ax.legend(title="Scaling", fontsize=10)
     ax.grid(True, linestyle='--', alpha=0.6)
-    
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, "hawkes_kernel_pvalues_pooled.svg"), format="svg")
     plt.close()
-    
     logging.info(f"Saved separated p-values plots to {save_dir}/")
+
+
+def plot_norm_mmd(results_norm_mmd, pooled_norm_mmd, config, save_dir):
+    ps = np.array(config.p_values)
+    colors = plt.cm.viridis(np.linspace(0, 0.9, len(config.scalings)))
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for scal, color in zip(config.scalings, colors):
+        means_n = np.array([np.mean(results_norm_mmd[scal][p]) for p in ps])
+        stds_n  = np.array([np.std(results_norm_mmd[scal][p]) for p in ps])
+        ax.plot(ps, means_n, label=f"Scale: {scal}", color=color, marker='o')
+        ax.fill_between(ps, means_n - stds_n, means_n + stds_n, color=color, alpha=0.2)
+    ax.set_xlabel("Power-law exponent p", fontsize=12)
+    ax.set_ylabel(r"Normalized MMD ($\hat{MMD}^2 / \sigma_{H0}$)", fontsize=12)
+    ax.set_title(f"Per-Rep Mean Normalized MMD ({config.num_rep} reps)", fontsize=13)
+    ax.legend(title="Scaling", fontsize=10)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "hawkes_kernel_norm_mmd_per_rep.svg"), format="svg")
+    plt.close()
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for scal, color in zip(config.scalings, colors):
+        pt_n = np.array([pooled_norm_mmd[scal][p] for p in ps])
+        ax.plot(ps, pt_n, label=f"Scale: {scal}", color=color, marker='s')
+    ax.set_xlabel("Power-law exponent p", fontsize=12)
+    ax.set_ylabel(r"Pooled Normalized MMD ($\hat{MMD}^2 / \sigma_{H0}$)", fontsize=12)
+    ax.set_title(f"Pooled Normalized MMD vs Power-law exp", fontsize=13)
+    ax.legend(title="Scaling", fontsize=10)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "hawkes_kernel_norm_mmd_pooled.svg"), format="svg")
+    plt.close()
+    logging.info(f"Saved normalized MMD plots to {save_dir}/")
 
 
 def plot_pooled(pooled_t1e, pooled_t2e, config, save_dir):
@@ -453,13 +250,11 @@ def plot_pooled(pooled_t1e, pooled_t2e, config, save_dir):
     axes[0].set_title(f"Pooled: Type 1 Error ({total_paths} paths, {total_atoms} MMD)", fontsize=13)
     axes[0].legend(title="Scaling", fontsize=10)
     axes[0].grid(True, linestyle='--', alpha=0.6)
-
     axes[1].set_xlabel("Power-law exponent p", fontsize=12)
     axes[1].set_ylabel("Pooled P[Type 2 Error] (%)", fontsize=12)
     axes[1].set_title(f"Pooled: Type 2 Error ({total_paths} paths, {total_atoms} MMD)", fontsize=13)
     axes[1].legend(title="Scaling", fontsize=10)
     axes[1].grid(True, linestyle='--', alpha=0.6)
-
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, "kernel_comparison_pooled.svg"), format="svg")
     plt.close()
@@ -482,11 +277,12 @@ def main():
     kernel_dir = os.path.join(config.data_dir, config.kernel_type)
     os.makedirs(kernel_dir, exist_ok=True)
 
-    results_t1e, results_t2e, results_pval, pooled_t1e, pooled_t2e, pooled_pval = execute_sweep(config)
+    results_t1e, results_t2e, results_pval, results_norm_mmd, pooled_t1e, pooled_t2e, pooled_pval, pooled_norm_mmd = execute_sweep(config)
 
     plot_per_rep(results_t1e, results_t2e, config, kernel_dir)
     plot_pooled(pooled_t1e, pooled_t2e, config, kernel_dir)
     plot_pvalues(results_pval, pooled_pval, config, kernel_dir)
+    plot_norm_mmd(results_norm_mmd, pooled_norm_mmd, config, kernel_dir)
 
     with open(os.path.join(kernel_dir, "metadata.json"), "w") as f:
         json.dump(config.__dict__, f, indent=4)
