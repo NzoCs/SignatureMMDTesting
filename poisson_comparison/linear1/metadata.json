@@ -1,0 +1,34 @@
+{
+    "data_dir": "poisson_comparison",
+    "device": "cuda",
+    "lambda0": 100.0,
+    "T": 1.0,
+    "grid_points": 100,
+    "ratios": [
+        0.5,
+        0.7,
+        0.8,
+        0.9,
+        0.95,
+        1.0,
+        1.05,
+        1.1,
+        1.2,
+        1.3,
+        1.5,
+        2.0
+    ],
+    "scalings": [
+        0.1,
+        0.25,
+        0.5,
+        1.0
+    ],
+    "n_atoms_delta": 500,
+    "n_paths": 128,
+    "n_bank": 512,
+    "num_rep": 10,
+    "alpha_test": 0.05,
+    "kernel_type": "linear",
+    "rbf_sigma": 1.0
+}
